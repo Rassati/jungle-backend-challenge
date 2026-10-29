@@ -6,9 +6,15 @@
   "scripts": {
     "test": "bun test ./tests/unit",
     "test:unit": "bun test ./tests/unit",
+    "test:integration": "bun test ./tests/integration --timeout 30000",
+    "db:migrate": "bun src/infrastructure/database/migrate.ts up",
+    "db:rollback": "bun src/infrastructure/database/migrate.ts down",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@mikro-orm/core": "6.6.0",
+    "@mikro-orm/migrations": "6.6.0",
+    "@mikro-orm/postgresql": "6.6.0",
     "decimal.js": "10.6.0"
   },
   "devDependencies": {
