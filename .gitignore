@@ -1,0 +1,10 @@
+node_modules/
+.tools/
+*.zip
+dist/
+coverage/
+.env
+*.log
+
+# Personal study material (local only)
+docs/GUIA-DE-ESTUDO.md
