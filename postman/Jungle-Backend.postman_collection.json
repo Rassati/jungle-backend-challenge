@@ -1,0 +1,49 @@
+{
+  "info": {
+    "name": "Jungle Backend — teste local",
+    "description": "Execute Criar carteira antes das demais operações. Reenvie a aposta sem alterar os dados para verificar idempotência.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:3000" },
+    { "key": "playerId", "value": "" },
+    { "key": "walletId", "value": "" },
+    { "key": "externalTransactionId", "value": "" },
+    { "key": "transactionId", "value": "" }
+  ],
+  "item": [
+    { "name": "1. Saúde das dependências", "request": { "method": "GET", "url": "{{baseUrl}}/health/ready" } },
+    {
+      "name": "2. Criar carteira com R$ 100",
+      "event": [
+        { "listen": "prerequest", "script": { "type": "text/javascript", "exec": [
+          "pm.collectionVariables.set('playerId', pm.variables.replaceIn('{{$guid}}'));",
+          "pm.collectionVariables.set('externalTransactionId', pm.variables.replaceIn('{{$guid}}'));"
+        ] } },
+        { "listen": "test", "script": { "type": "text/javascript", "exec": [
+          "pm.test('Carteira criada', () => pm.response.to.have.status(201));",
+          "if (pm.response.code === 201) pm.collectionVariables.set('walletId', pm.response.json().id);"
+        ] } }
+      ],
+      "request": { "method": "POST", "url": "{{baseUrl}}/wallets", "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\n  \"playerId\": \"{{playerId}}\",\n  \"initialBalance\": { \"amount\": \"100.00\", \"currency\": \"BRL\" }\n}", "options": { "raw": { "language": "json" } } } }
+    },
+    {
+      "name": "3. Apostar R$ 25 — reenviar verifica idempotência",
+      "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "pm.test('Operação processada', () => pm.response.to.have.status(200));",
+        "if (pm.response.code === 200) pm.collectionVariables.set('transactionId', pm.response.json().transactionId);"
+      ] } }],
+      "request": { "method": "POST", "url": "{{baseUrl}}/wagering/transactions", "header": [
+        { "key": "Content-Type", "value": "application/json" },
+        { "key": "Idempotency-Key", "value": "provider-demo:{{externalTransactionId}}" }
+      ], "body": { "mode": "raw", "raw": "{\n  \"providerId\": \"provider-demo\",\n  \"externalTransactionId\": \"{{externalTransactionId}}\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-demo\",\n  \"gameId\": \"game-demo\",\n  \"kind\": \"BET\",\n  \"money\": { \"amount\": \"25.00\", \"currency\": \"BRL\" }\n}", "options": { "raw": { "language": "json" } } } }
+    },
+    { "name": "4. Consultar saldo", "request": { "method": "GET", "url": "{{baseUrl}}/wallets/{{walletId}}" } },
+    { "name": "5. Consultar histórico", "request": { "method": "GET", "url": "{{baseUrl}}/wallets/{{walletId}}/ledger?limit=50" } },
+    { "name": "6. Consultar transação", "request": { "method": "GET", "url": "{{baseUrl}}/wagering/transactions/{{transactionId}}" } },
+    { "name": "7. Consultar transação no provedor", "request": { "method": "GET", "url": "{{baseUrl}}/providers/provider-demo/wagering/transactions/{{externalTransactionId}}" } },
+    { "name": "8. Reconciliar saldo", "request": { "method": "POST", "url": "{{baseUrl}}/wallets/{{walletId}}/reconciliation" } },
+    { "name": "9. Métricas", "request": { "method": "GET", "url": "{{baseUrl}}/metrics" } }
+  ]
+}

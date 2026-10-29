@@ -52,10 +52,20 @@ Eventos possuem classe abstrata e subclasses concretas com nomes e versão defin
 
 Outbox persistente para eventos após commit; publicadores concorrentes usarão seleção bloqueada e recuperação com tentativas limitadas por execução. Publicação pode duplicar se houver falha entre envio e marcação de sucesso: consumidores precisam deduplicar por eventId. Inbox persistente deduplicará mensagens de entrada. Confirmação SQS apenas após commit.
 
+## Implementado: fronteira HTTP
+
+NestJS com injeção de dependência explícita para funcionar com Bun sem depender de inferência de metadata de construtores. Zod valida corpos, UUIDs, headers e parâmetros; propriedades extras no corpo são rejeitadas. OPENING e provider interno não são aceitos pela API. Money continua validando suas próprias invariantes, independentemente do transporte.
+
+Controller chama o mesmo processamento transacional disponível ao futuro adaptador SQS. Respostas HTTP distinguem entrada inválida (400), ausência (404), conflito (409), rejeição de negócio (422), pendência (202) e falhas transitórias reconhecidas de banco (503, Retry-After). Carteiras criadas retornam 201, operações processadas/replays retornam 200. Falhas inesperadas retornam 500 sem SQL, credenciais ou mensagens internas.
+
+Consultas não alteram dados. Ledger ordenado por (created_at,id), com paginação keyset ascendente e limite de 1 a 100; cursor base64url vinculado à carteira preserva os seis dígitos de microssegundos do PostgreSQL. É um identificador de posição, sem finalidade de autorização. Reconciliação usa uma única consulta SQL para obter saldo e soma do ledger no mesmo snapshot MVCC; sinaliza divergência, registra log e incrementa métrica, sem reparo automático.
+
+Logs JSON de operações expõem identificadores de correlação/operação/carteira/provedor e estado, sem valores financeiros. Métricas HTTP cobrem latência, estados retornados, replays e divergências. Métricas de workers, retries, DLQ, lock e outbox lag serão adicionadas com os workers. Health live não verifica dependências; ready consulta PostgreSQL e GetQueueUrl no SQS. Os dois endpoints permanecem abertos.
+
 ## Decisão de escopo: autenticação
 
-Será usado um ponto de extensão explícito sem autenticação real, documentando integração futura com IdP OIDC. O enunciado permite essa omissão e prioriza correção financeira, concorrência e idempotência. Endpoints de saúde permanecerão abertos. Autorização por provedor não será apresentada como implementada.
+ProviderIdentityGuard é um ponto de extensão explícito sem autenticação real. Uma integração futura validará assinatura, emissor, audiência e expiração de tokens de IdP OIDC via JWKS, e mapeará o sujeito para a identidade autorizada do provedor antes de aceitar providerId. O enunciado permite a omissão da implementação e prioriza correção financeira, concorrência e idempotência. Endpoints de saúde permanecem abertos. Autorização por provedor não está implementada.
 
 ## Validação disponível nesta etapa
 
-77 testes e checagem estática de TypeScript. Integração com PostgreSQL real: mapeamento monetário, constraints, imutabilidade, reversibilidade das migrations, 50 reenvios paralelos com um débito, duas apostas de 80 disputando saldo de 100, três processos Bun independentes, carteiras distintas em paralelo, replay de saldo histórico, reversões concorrentes, inbox e rollback financeiro completo quando a gravação da outbox falha. Testes de SQS, crash após commit/antes do ack, publishers concorrentes e reprocessamento/reinício ainda precisam ser implementados.
+88 testes e checagem estática de TypeScript. Integração com PostgreSQL real: mapeamento monetário, constraints, imutabilidade, reversibilidade das migrations, 50 reenvios paralelos com um débito, duas apostas de 80 disputando saldo de 100, três processos Bun independentes, carteiras distintas em paralelo, replay de saldo histórico, reversões concorrentes, inbox e rollback financeiro completo quando a gravação da outbox falha. Testes HTTP com PostgreSQL e LocalStack verificam contratos, status, consultas, cursor, reconciliação e indisponibilidade de banco/fila. Testes de consumo SQS, crash após commit/antes do ack, publishers concorrentes e reprocessamento/reinício ainda precisam ser implementados.
