@@ -5,13 +5,14 @@ import { Body, Catch, Controller, Get, Headers, HttpCode, HttpException, Inject,
 import { NestFactory } from '@nestjs/core';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { SQSClient, GetQueueUrlCommand } from '@aws-sdk/client-sqs';
-import { Counter, Histogram, Registry } from 'prom-client';
+import { Counter, Histogram } from 'prom-client';
 import { ZodError } from 'zod';
 import type { Request, Response, NextFunction } from 'express';
 import { WageringStore } from '../infrastructure/database/wagering-store';
 import { Queries } from '../infrastructure/database/queries';
 import { DomainError } from '../domain/errors';
 import { identifier, ledgerQuery, openWalletInput, uuid, wagerInput } from './validation';
+import { Telemetry } from '../observability';
 
 // Explicit extension point for a future OIDC provider identity integration.
 @Injectable()
@@ -38,7 +39,7 @@ class ApiErrorFilter implements ExceptionFilter {
     } else {
       const failure = error as { code?: string; cause?: { code?: string } };
       const sqlCode = failure?.code ?? failure?.cause?.code;
-      if (sqlCode && (/^08/.test(sqlCode) || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','57P01','53300','55P03','40P01','40001'].includes(sqlCode))) {
+      if (sqlCode && (/^08/.test(sqlCode) || ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','57P01','57014','53300','55P03','40P01','40001'].includes(sqlCode))) {
         status = 503; code = 'INFRASTRUCTURE_UNAVAILABLE';
       }
       log({ level: 'error', event: 'http_failure', correlationId: response.locals.correlationId, code });
@@ -48,12 +49,13 @@ class ApiErrorFilter implements ExceptionFilter {
   }
 }
 
-export async function createApp(orm: MikroORM, options: { sqsEndpoint?: string } = {}) {
-  const store = new WageringStore(orm);
+export async function createApp(orm: MikroORM, options: { sqsEndpoint?: string; telemetry?: Telemetry } = {}) {
+  const telemetry = options.telemetry ?? new Telemetry();
+  const store = new WageringStore(orm, telemetry);
   const queries = new Queries(orm);
   const sqs = new SQSClient({ region: process.env.AWS_REGION ?? 'us-east-1', endpoint: options.sqsEndpoint ?? process.env.SQS_ENDPOINT ?? 'http://localhost:4566',
     credentials: { accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? 'test', secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? 'test' }, maxAttempts: 1 });
-  const registry = new Registry();
+  const registry = telemetry.registry;
   const mismatches = new Counter({ name: 'wallet_reconciliation_mismatches_total', help: 'Reconciliation divergences', registers: [registry] });
   const outcomes = new Counter({ name: 'wager_http_transactions_total', help: 'Transaction responses', labelNames: ['status'], registers: [registry] });
   const duplicates = new Counter({ name: 'wager_http_duplicates_total', help: 'Idempotent replays', registers: [registry] });

@@ -1,0 +1,9 @@
+.git
+.tools
+node_modules
+docs/GUIA-DE-ESTUDO.md
+*.zip
+*.log
+.env
+coverage
+dist

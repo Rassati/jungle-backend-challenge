@@ -5,6 +5,7 @@
   "packageManager": "bun@1.3.1",
   "scripts": {
     "start": "bun src/main.ts",
+    "demo:sqs": "bun scripts/demo-sqs.ts",
     "test": "bun test ./tests/unit ./tests/integration --timeout 30000",
     "test:unit": "bun test ./tests/unit",
     "test:integration": "bun test ./tests/integration --timeout 30000",

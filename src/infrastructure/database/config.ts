@@ -35,5 +35,6 @@ export function databaseConfig(clientUrl = process.env.DATABASE_URL ??
     extensions: [Migrator],
     migrations: { migrationsList: [Migration202610290001], transactional: true, allOrNothing: true },
     pool: { min: 0, max: 10 },
+    driverOptions: { connection: { connectionTimeoutMillis: 5000, query_timeout: 10000, statement_timeout: 10000 } },
   });
 }

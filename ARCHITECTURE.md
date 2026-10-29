@@ -1,20 +1,20 @@
 # Decisões de arquitetura
 
-Documento incremental. As seções distinguem o que já existe do que ainda está planejado.
+Decisões, garantias e limites da implementação.
 
 ## Implementado: domínio monetário
 
 `Money` encapsula decimal.js com precisão de 50 dígitos, entrada/saída decimal textual e escala de saída de duas casas. Limite absoluto: `999999999999999999.99`, correspondente ao futuro `NUMERIC(20,2)`. Valores com mais de duas casas são rejeitados em vez de arredondados. Não há conversão monetária para `number`.
 
-O objeto permanece multi-moeda, validando formato de três letras maiúsculas; a futura fronteira HTTP/SQS aceitará somente BRL, como permitido pelo desafio. Operações entre moedas diferentes são erros de domínio.
+O objeto permanece multi-moeda, validando formato de três letras maiúsculas; a fronteira HTTP/SQS aceita somente BRL, como permitido pelo desafio. Operações entre moedas diferentes são erros de domínio.
 
 ## Implementado: carteira e ledger
 
-A carteira encapsula o saldo. Créditos e débitos positivos produzem lançamentos com saldo anterior e posterior; falhas deixam o estado intacto. Operações sem efeito financeiro não chamam esses métodos. `version` começa em 1 e só incrementa em movimentações. Uma carteira aberta com saldo positivo disponibiliza um lançamento de abertura; a aplicação deverá persistir a transação interna OPENING e o lançamento atomicamente.
+A carteira encapsula o saldo. Créditos e débitos positivos produzem lançamentos com saldo anterior e posterior; falhas deixam o estado intacto. Operações sem efeito financeiro não chamam esses métodos. `version` começa em 1 e só incrementa em movimentações. Uma carteira aberta com saldo positivo disponibiliza um lançamento de abertura; a aplicação persiste a transação interna OPENING e o lançamento atomicamente.
 
 `WalletLedgerEntry` não expõe mutações e copia as datas nas entradas/saídas. Sua factory verifica positividade, direção, não-negatividade dos saldos e aritmética. Reidratação reconstrói estado persistido sem repetir regras de transição.
 
-Essas classes não garantem por si só unicidade ou concorrência entre instâncias. Essas garantias serão aplicadas no schema e na camada transacional.
+Essas classes não garantem por si só unicidade ou concorrência entre instâncias. Essas garantias são aplicadas no schema e na camada transacional.
 
 ## Configurado: ambiente de desenvolvimento
 
@@ -30,7 +30,7 @@ Taxonomia inicial de rejeições: INSUFFICIENT_FUNDS (aposta sem saldo), REVERSA
 
 ## Implementado: identificação do payload
 
-Hash SHA-256 do JSON com chaves ordenadas recursivamente, contendo apenas os campos de negócio explicitamente selecionados. Header Idempotency-Key, messageId e correlationId não participam. O valor monetário textual informado é preservado no hash: mudar sua representação é uma mudança de payload. O código prepara o hash e permite compará-lo; ainda não constitui idempotência persistente sem o caso de uso transacional.
+Hash SHA-256 do JSON com chaves ordenadas recursivamente, contendo apenas os campos de negócio explicitamente selecionados. Header Idempotency-Key, messageId e correlationId não participam. O valor monetário textual informado é preservado no hash: mudar sua representação é uma mudança de payload. O processamento transacional compara o hash contra o valor persistido para diferenciar replay de conflito.
 
 ## Implementado: schema e migrations
 
@@ -44,23 +44,31 @@ O schema protege saldo não-negativo, carteira única por player/moeda, chave de
 
 INSERT com ON CONFLICT e as constraints do schema arbitram duplicações. A mesma chave e mesmo hash devolvem o resultado salvo, inclusive saldo histórico. A mesma chave com outro hash ou o mesmo identificador externo com outra chave são conflitos. Chaves de idempotência são globais; recomenda-se prefixá-las pelo provedor. A abertura de carteira repetida é conflito.
 
-Quando a entrada contém identidade de mensagem, o inbox valida seu hash e marca processed_at dentro da mesma transação. Os adaptadores HTTP/SQS usarão a mesma operação submit. O consumidor SQS e a política de ack ainda não existem nesta etapa.
+Quando a entrada contém identidade de mensagem, o inbox valida seu hash e marca processed_at dentro da mesma transação. Os adaptadores HTTP/SQS usam a mesma operação submit. O consumidor SQS confirma mensagens somente depois desse método retornar com o commit concluído.
 
 Eventos possuem classe abstrata e subclasses concretas com nomes e versão definidos no tipo. Payloads monetários são objetos serializáveis com strings. Os eventos ficam na outbox; nenhum envio externo ocorre durante a transação financeira.
 
-## Planejado: publicação e processamento
+## Implementado: publicação e processamento
 
-Outbox persistente para eventos após commit; publicadores concorrentes usarão seleção bloqueada e recuperação com tentativas limitadas por execução. Publicação pode duplicar se houver falha entre envio e marcação de sucesso: consumidores precisam deduplicar por eventId. Inbox persistente deduplicará mensagens de entrada. Confirmação SQS apenas após commit.
+Outbox persistente selecionada por FOR UPDATE SKIP LOCKED, um evento por transação. O bloqueio é mantido durante o envio, limitado por timeout de 5 segundos. Essa escolha reduz complexidade de leases e permite que a queda de um processo libere automaticamente a reserva. O custo é ocupar uma conexão enquanto há uma chamada de rede; foi aceito para o escopo do teste. A transação financeira original já está confirmada antes desse envio.
+
+Tentativas e próxima data de publicação são persistidas, com espera exponencial limitada a 300 segundos. Eventos confirmados não são descartados por limite global de tentativas: uma indisponibilidade prolongada deve permitir recuperação posterior. A publicação pode duplicar se o processo cair após o envio e antes da marcação de sucesso. O eventId é estável; consumidores de saída devem deduplicá-lo em persistência, inclusive além da janela de deduplicação FIFO de cinco minutos.
+
+QueueConsumer valida o mesmo contrato de entrada da API. Mensagens internas não exigem autenticação, mas providerId e demais campos continuam validados. Heartbeat renova a visibilidade durante o processamento. Sucesso e rejeição de negócio persistida resultam em ack após commit. Mensagens inválidas e conflitos permanentes são enviadas à DLQ; falhas transitórias aguardam backoff e têm no máximo cinco recebimentos antes da DLQ. Envio para DLQ precede exclusão na origem e preserva o corpo para diagnóstico. Se houver queda entre as duas ações, a DLQ pode receber duplicatas, identificáveis pelo messageId; isso não reaplica efeitos financeiros.
+
+Referências pendentes têm próximo horário e contador persistidos. ReferenceWorker lista até 20 candidatas por segundo; cada tentativa bloqueia primeiro a carteira e depois revalida estado e horário da transação. Processos que perderem a corrida não reaplicam a operação. A espera inicial é 1 segundo e dobra até o teto de 300 segundos. Após até 12 reprocessamentos sem referência processável, a operação é rejeitada com REFERENCE_NOT_FOUND e evento correspondente. Reiniciar o processo preserva a agenda. Uma referência válida ainda é aplicada na última tentativa antes de decidir a expiração.
+
+SIGTERM/SIGINT fecham a API, interrompem a aquisição e aguardam iterações em andamento antes de fechar os clientes. Caso uma mensagem seja recebida durante a parada, sua visibilidade é devolvida. Timeout de conexão de banco é 5 segundos; queries e statements têm limite de 10 segundos e locks financeiros de 5 segundos. O Compose concede 30 segundos de encerramento e executa Bun diretamente como PID 1.
 
 ## Implementado: fronteira HTTP
 
 NestJS com injeção de dependência explícita para funcionar com Bun sem depender de inferência de metadata de construtores. Zod valida corpos, UUIDs, headers e parâmetros; propriedades extras no corpo são rejeitadas. OPENING e provider interno não são aceitos pela API. Money continua validando suas próprias invariantes, independentemente do transporte.
 
-Controller chama o mesmo processamento transacional disponível ao futuro adaptador SQS. Respostas HTTP distinguem entrada inválida (400), ausência (404), conflito (409), rejeição de negócio (422), pendência (202) e falhas transitórias reconhecidas de banco (503, Retry-After). Carteiras criadas retornam 201, operações processadas/replays retornam 200. Falhas inesperadas retornam 500 sem SQL, credenciais ou mensagens internas.
+Controller chama o mesmo processamento transacional do adaptador SQS. Respostas HTTP distinguem entrada inválida (400), ausência (404), conflito (409), rejeição de negócio (422), pendência (202) e falhas transitórias reconhecidas de banco (503, Retry-After). Carteiras criadas retornam 201, operações processadas/replays retornam 200. Falhas inesperadas retornam 500 sem SQL, credenciais ou mensagens internas.
 
 Consultas não alteram dados. Ledger ordenado por (created_at,id), com paginação keyset ascendente e limite de 1 a 100; cursor base64url vinculado à carteira preserva os seis dígitos de microssegundos do PostgreSQL. É um identificador de posição, sem finalidade de autorização. Reconciliação usa uma única consulta SQL para obter saldo e soma do ledger no mesmo snapshot MVCC; sinaliza divergência, registra log e incrementa métrica, sem reparo automático.
 
-Logs JSON de operações expõem identificadores de correlação/operação/carteira/provedor e estado, sem valores financeiros. Métricas HTTP cobrem latência, estados retornados, replays e divergências. Métricas de workers, retries, DLQ, lock e outbox lag serão adicionadas com os workers. Health live não verifica dependências; ready consulta PostgreSQL e GetQueueUrl no SQS. Os dois endpoints permanecem abertos.
+Logs JSON de operações expõem identificadores de correlação/operação/carteira/provedor e estado, sem valores financeiros. Métricas cobrem operações por estado, replays, retries por subsistema, DLQ, conflitos de lock, atraso da outbox, processamento, latência HTTP e divergências. Contadores de processo reiniciam com o processo; as garantias financeiras não dependem deles. Health live não verifica dependências; ready consulta PostgreSQL e GetQueueUrl no SQS. Os dois endpoints permanecem abertos.
 
 ## Decisão de escopo: autenticação
 
@@ -68,4 +76,8 @@ ProviderIdentityGuard é um ponto de extensão explícito sem autenticação rea
 
 ## Validação disponível nesta etapa
 
-88 testes e checagem estática de TypeScript. Integração com PostgreSQL real: mapeamento monetário, constraints, imutabilidade, reversibilidade das migrations, 50 reenvios paralelos com um débito, duas apostas de 80 disputando saldo de 100, três processos Bun independentes, carteiras distintas em paralelo, replay de saldo histórico, reversões concorrentes, inbox e rollback financeiro completo quando a gravação da outbox falha. Testes HTTP com PostgreSQL e LocalStack verificam contratos, status, consultas, cursor, reconciliação e indisponibilidade de banco/fila. Testes de consumo SQS, crash após commit/antes do ack, publishers concorrentes e reprocessamento/reinício ainda precisam ser implementados.
+100 testes passam em Windows/Bun e Linux/Docker, além da checagem estática. PostgreSQL real: mapeamento monetário, constraints, imutabilidade, migrations reversíveis, 50 reenvios paralelos com um débito, disputa por saldo, três processos Bun, carteiras independentes, replay histórico, reversões concorrentes, inbox e rollback financeiro quando a outbox falha. HTTP: contratos, status, consultas, cursor, reconciliação e dependências indisponíveis. SQS real via LocalStack: redelivery, publicadores concorrentes, retry/DLQ, referências fora de ordem/expiração, processo morto após commit antes do ack e publicador morto após enviar antes de marcar sucesso. Novas conexões/processos retomam o trabalho e a reconciliação verifica o saldo final.
+
+## Limitações e opcionais
+
+Autenticação OIDC é uma extensão documentada. Não foram implementados OpenTelemetry, dashboard, teste de carga nem partidas dobradas. Ordenação estrita de eventos por carteira não é prometida: eventos têm identidade/versão e os consumidores devem tolerar duplicação e reordenação. A saída é um contrato de integração, sem implementação de um sistema downstream de negócio. LocalStack é um emulador local; suas filas não usam armazenamento persistente nesta configuração. O teste de recuperação reinicia processos da aplicação, preservando banco e broker. Não há promessa de reconstruir mensagens já consumidas se o armazenamento do próprio broker for apagado.

@@ -9,7 +9,9 @@ import type { WalletLedgerEntry } from '../../domain/ledger-entry';
 import { WagerTransaction, type FailureCode, type WagerKind, type WagerStatus } from '../../domain/wager-transaction';
 import { IntegrationEvent, WalletBalanceChanged, WagerTransactionProcessed,
   WagerTransactionRejected, WagerTransactionPendingReference } from '../../domain/integration-event';
-import { WalletSchema } from './config';
+import { WalletSchema, type WalletRecord } from './config';
+import { Telemetry } from '../../observability';
+import { InboxMessage } from '../../domain/inbox-message';
 
 export interface TransactionResult {
   transactionId: string;
@@ -26,6 +28,7 @@ interface TransactionRow {
   reference_external_transaction_id: string | null; reference_transaction_id: string | null;
   failure_code: FailureCode | null; created_at: Date; processed_at: Date | null;
   result: TransactionResult;
+  reference_attempts: number;
 }
 
 export interface SubmissionContext {
@@ -34,7 +37,7 @@ export interface SubmissionContext {
 }
 
 export class WageringStore {
-  constructor(private readonly orm: MikroORM) {}
+  constructor(private readonly orm: MikroORM, private readonly telemetry = new Telemetry()) {}
 
   async openWallet(playerId: string, initialBalance: MoneyProps): Promise<{
     id: string; playerId: string; balance: MoneyProps; version: number;
@@ -68,15 +71,18 @@ export class WageringStore {
     const tx = WagerTransaction.create({ ...payload, id: randomUUID(), idempotencyKey,
       payloadHash: hash, money: Money.from(payload.money), createdAt: new Date() });
     if (tx.money.currency !== 'BRL') throw new DomainError('UNSUPPORTED_CURRENCY', 'Only BRL is accepted.');
-    return this.orm.em.fork().transactional(async em => {
-      // All callers acquire the wallet lock first, including future retry workers.
+    const end = this.telemetry.processing.startTimer();
+    try {
+    const result = await this.orm.em.fork().transactional(async em => {
+      await em.execute("SET LOCAL lock_timeout = '5s'");
+      // All callers acquire the wallet lock first, including retry workers.
       const record = await em.findOne(WalletSchema, { id: payload.walletId }, { lockMode: LockMode.PESSIMISTIC_WRITE });
       if (!record) throw new DomainError('WALLET_NOT_FOUND', 'Wallet does not exist.');
       if (record.currency !== payload.money.currency) throw new DomainError('CURRENCY_MISMATCH', 'Currency differs from wallet.');
-      const wallet = Wallet.rehydrate({ ...record, balance: Money.from({ amount: record.balance, currency: record.currency }) });
       if (context.inbox) {
+        const identity = InboxMessage.receive({ ...context.inbox, payloadHash: hash });
         await em.execute(`INSERT INTO inbox_messages (consumer_name,message_id,payload_hash,received_at)
-          VALUES (?, ?, ?, now()) ON CONFLICT DO NOTHING`, [context.inbox.consumerName, context.inbox.messageId, hash]);
+          VALUES (?, ?, ?, now()) ON CONFLICT DO NOTHING`, [identity.consumerName, identity.messageId, identity.payloadHash]);
         const inbox = (await em.execute(`SELECT payload_hash FROM inbox_messages WHERE consumer_name = ? AND message_id = ? FOR UPDATE`,
           [context.inbox.consumerName, context.inbox.messageId]))[0];
         if (inbox?.payload_hash !== hash) throw new DomainError('INBOX_CONFLICT', 'Message id was reused with a different payload.');
@@ -97,14 +103,51 @@ export class WageringStore {
         await this.finishInbox(em, context);
         return { ...previous.result, idempotentReplay: true };
       }
+      const result = await this.applyAndSave(em, record, tx, context);
+      await this.finishInbox(em, context);
+      return result;
+    });
+    this.telemetry.transactions.inc({ status: result.status });
+    if (result.idempotentReplay) this.telemetry.duplicates.inc();
+    return result;
+    } catch (error) {
+      if (['55P03', '40P01'].includes((error as { code?: string }).code ?? '')) this.telemetry.lockConflicts.inc();
+      throw error;
+    } finally { end(); }
+  }
+
+  async retryPending(transactionId: string, now = new Date(), maxAttempts = 12): Promise<TransactionResult | undefined> {
+    const candidate: TransactionRow | undefined = (await this.orm.em.getConnection().execute<TransactionRow[]>(
+      "SELECT * FROM wager_transactions WHERE id = ? AND status = 'PENDING_REFERENCE'", [transactionId]))[0];
+    if (!candidate) return;
+    const result = await this.orm.em.fork().transactional(async em => {
+      await em.execute("SET LOCAL lock_timeout = '5s'");
+      const record = await em.findOneOrFail(WalletSchema, { id: candidate.wallet_id }, { lockMode: LockMode.PESSIMISTIC_WRITE });
+      const row = (await em.execute<TransactionRow[]>(`SELECT * FROM wager_transactions WHERE id = ?
+        AND status = 'PENDING_REFERENCE' AND next_attempt_at <= ? FOR UPDATE`, [transactionId, now]))[0];
+      if (!row) return;
+      return this.applyAndSave(em, record, this.rehydrateTransaction(row), { correlationId: transactionId },
+        { attempts: row.reference_attempts + 1, maxAttempts, now });
+    });
+    if (result) {
+      this.telemetry.retries.inc({ subsystem: 'reference' });
+      this.telemetry.transactions.inc({ status: result.status });
+    }
+    return result;
+  }
+
+  private async applyAndSave(em: EntityManager, record: WalletRecord, tx: WagerTransaction, context: SubmissionContext,
+    retry?: { attempts: number; maxAttempts: number; now: Date }): Promise<TransactionResult> {
+      const wallet = Wallet.rehydrate({ ...record, balance: Money.from({ amount: record.balance, currency: record.currency }) });
       const refRow: TransactionRow | undefined = tx.referenceExternalTransactionId
         ? (await em.execute<TransactionRow[]>('SELECT * FROM wager_transactions WHERE provider_id = ? AND external_transaction_id = ?',
           [tx.providerId, tx.referenceExternalTransactionId]))[0] : undefined;
       const ref = refRow ? this.rehydrateTransaction(refRow) : undefined;
       const reversed = ref && tx.requiresReference() ? (await em.execute(`SELECT id FROM wager_transactions
         WHERE reference_transaction_id = ? AND kind = ? AND status = 'PROCESSED'`, [ref.id, tx.kind])).length > 0 : false;
-      const at = new Date();
+      const at = retry?.now ?? new Date();
       const entry = tx.apply(wallet, { entryId: randomUUID(), at }, ref, reversed);
+      if (tx.status === 'PENDING_REFERENCE' && retry && retry.attempts >= retry.maxAttempts) tx.reject('REFERENCE_NOT_FOUND');
       if (entry) {
         record.balance = wallet.balance.toString();
         record.version = wallet.version;
@@ -115,18 +158,17 @@ export class WageringStore {
       const result: TransactionResult = { transactionId: tx.id, status: tx.status, balance: wallet.balance.toJSON(),
         ...(tx.failureCode ? { failureCode: tx.failureCode } : {}), idempotentReplay: false };
       await em.execute(`UPDATE wager_transactions SET status = ?, reference_transaction_id = ?, failure_code = ?,
-        processed_at = ?, result = ?::jsonb, next_attempt_at = ? WHERE id = ?`,
+        processed_at = ?, result = ?::jsonb, next_attempt_at = ?, reference_attempts = ? WHERE id = ?`,
       [tx.status, tx.referenceTransactionId ?? null, tx.failureCode ?? null, tx.processedAt ?? null,
-        JSON.stringify(result), tx.status === 'PENDING_REFERENCE' ? new Date(at.getTime() + 1000) : null, tx.id]);
+        JSON.stringify(result), tx.status === 'PENDING_REFERENCE' ? new Date(at.getTime() + Math.min(300000, 1000 * 2 ** (retry?.attempts ?? 0))) : null,
+        retry?.attempts ?? 0, tx.id]);
       const props = { eventId: randomUUID(), aggregateId: wallet.id, correlationId: context.correlationId,
         causationId: context.inbox?.messageId, occurredAt: at, data: { ...result, providerId: tx.providerId } };
       const event = tx.status === 'PROCESSED' ? WagerTransactionProcessed.from(props)
         : tx.status === 'REJECTED' ? WagerTransactionRejected.from(props) : WagerTransactionPendingReference.from(props);
-      await this.saveEvent(em, event);
+      if (!retry || tx.status !== 'PENDING_REFERENCE') await this.saveEvent(em, event);
       if (entry) await this.saveEvent(em, WalletBalanceChanged.from({ ...props, eventId: randomUUID(), data: this.balanceData(wallet, entry) }));
-      await this.finishInbox(em, context);
       return result;
-    });
   }
 
   private rehydrateTransaction(row: TransactionRow): WagerTransaction {
