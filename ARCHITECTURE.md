@@ -38,11 +38,15 @@ MikroORM 6.6 com metadata de persistência separada do domínio. Valor monetári
 
 O schema protege saldo não-negativo, carteira única por player/moeda, chave de idempotência global, identificador externo único por provedor, lançamento único por transação/carteira e reversão processada única por referência/tipo. Chaves estrangeiras compostas alinham carteira e moeda dos registros. CHECK valida a aritmética do ledger; triggers proíbem UPDATE, DELETE e TRUNCATE do ledger e UPDATE de transações terminais. O administrador do banco ainda pode alterar o schema: a proteção pressupõe uma aplicação que não modifica DDL em operação normal.
 
-## Planejado: caso de uso e concorrência
+## Implementado: caso de uso e concorrência
 
-MikroORM e PostgreSQL. Uma transação SQL bloqueará a linha da carteira com `FOR UPDATE` e persistirá conjuntamente carteira, resultado da operação, ledger, inbox e outbox. Carteiras distintas terão bloqueios independentes. A validação e o bloqueio ocorrerão antes de calcular o novo saldo.
+`WageringStore` usa `EntityManager.transactional()` e `LockMode.PESSIMISTIC_WRITE` para bloquear a carteira antes de calcular o novo saldo. Carteira, resultado da operação, ledger, inbox e outbox são confirmados juntos. Carteiras distintas usam bloqueios independentes. Abertura com saldo positivo grava OPENING, lançamento e evento de alteração do saldo na mesma transação.
 
-Schema com restrições de unicidade para carteira por jogador/moeda, identificadores de operações e lançamentos por operação/carteira; saldo não-negativo e ledger imutável também serão protegidos no banco. O replay devolverá o resultado original salvo, sem recalcular o saldo atual.
+INSERT com ON CONFLICT e as constraints do schema arbitram duplicações. A mesma chave e mesmo hash devolvem o resultado salvo, inclusive saldo histórico. A mesma chave com outro hash ou o mesmo identificador externo com outra chave são conflitos. Chaves de idempotência são globais; recomenda-se prefixá-las pelo provedor. A abertura de carteira repetida é conflito.
+
+Quando a entrada contém identidade de mensagem, o inbox valida seu hash e marca processed_at dentro da mesma transação. Os adaptadores HTTP/SQS usarão a mesma operação submit. O consumidor SQS e a política de ack ainda não existem nesta etapa.
+
+Eventos possuem classe abstrata e subclasses concretas com nomes e versão definidos no tipo. Payloads monetários são objetos serializáveis com strings. Os eventos ficam na outbox; nenhum envio externo ocorre durante a transação financeira.
 
 ## Planejado: publicação e processamento
 
@@ -54,4 +58,4 @@ Será usado um ponto de extensão explícito sem autenticação real, documentan
 
 ## Validação disponível nesta etapa
 
-Testes unitários de Money, Wallet, ledger, transações e hash; checagem estática de TypeScript. Integração com PostgreSQL real: mapeamento exato de dinheiro, constraints, imutabilidade, rollback SQL conjunto e reversibilidade das migrations. Testes de mensageria, caso de uso completo, falhas de processos e múltiplas instâncias ainda precisam ser implementados.
+77 testes e checagem estática de TypeScript. Integração com PostgreSQL real: mapeamento monetário, constraints, imutabilidade, reversibilidade das migrations, 50 reenvios paralelos com um débito, duas apostas de 80 disputando saldo de 100, três processos Bun independentes, carteiras distintas em paralelo, replay de saldo histórico, reversões concorrentes, inbox e rollback financeiro completo quando a gravação da outbox falha. Testes de SQS, crash após commit/antes do ack, publishers concorrentes e reprocessamento/reinício ainda precisam ser implementados.

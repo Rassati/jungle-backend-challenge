@@ -4,7 +4,7 @@ Implementação em andamento do desafio Jungle Gaming. O enunciado original est�
 
 ## Estado atual
 
-Domínio: dinheiro, carteira, ledger e regras de apostas/reversões com testes unitários. PostgreSQL e LocalStack configurados. Schema com migrations reversíveis, restrições financeiras e testes de integração reais. API, caso de uso transacional completo e consumidores ainda serão implementados.
+Domínio: dinheiro, carteira, ledger e regras de apostas/reversões. PostgreSQL e LocalStack configurados. Migrations reversíveis, restrições financeiras e processamento transacional com bloqueio por carteira, idempotência persistente, inbox e gravação de eventos na outbox. Testes reais incluem 50 envios concorrentes e três processos Bun independentes. API, consumidores/publicadores SQS e worker de referências pendentes ainda serão implementados.
 
 ## Ferramentas
 
