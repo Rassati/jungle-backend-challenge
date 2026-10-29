@@ -60,6 +60,7 @@ describe('Atomic wagering use case against PostgreSQL', () => {
     try { await store.openWallet(wallet.playerId, wallet.balance); }
     catch (error) { conflict = error; }
     expect(conflict).toHaveProperty('code', 'WALLET_CONFLICT');
+    expect(await orm.em.getConnection().execute("SELECT id FROM outbox_messages WHERE aggregate_id = ? AND event_type = 'WagerTransactionProcessed'", [wallet.id])).toHaveLength(1);
   });
 
   test('50 concurrent identical requests debit only once and return the original response', async () => {
@@ -126,7 +127,7 @@ describe('Atomic wagering use case against PostgreSQL', () => {
     const context = { correlationId: key, inbox: { consumerName: 'test-consumer', messageId: randomUUID() } };
     await store.submit(payload, key, context);
     expect((await store.submit(payload, key, context)).idempotentReplay).toBe(true);
-    expect(await orm.em.getConnection().execute('SELECT id FROM outbox_messages WHERE aggregate_id = ?', [wallet.id])).toHaveLength(3);
+    expect(await orm.em.getConnection().execute('SELECT id FROM outbox_messages WHERE aggregate_id = ?', [wallet.id])).toHaveLength(4);
     const rows = await orm.em.getConnection().execute('SELECT processed_at FROM inbox_messages WHERE message_id = ?', [context.inbox.messageId]);
     expect(Number.isNaN(new Date(rows[0]?.processed_at).getTime())).toBe(false);
     await assertReconciled(wallet.id, '75.00');
@@ -146,7 +147,7 @@ describe('Atomic wagering use case against PostgreSQL', () => {
       await assertReconciled(wallet.id, '100.00');
       expect(await connection.execute('SELECT id FROM wager_transactions WHERE idempotency_key = ?', [key])).toHaveLength(0);
       expect(await connection.execute('SELECT message_id FROM inbox_messages WHERE message_id = ?', [context.inbox.messageId])).toHaveLength(0);
-      expect(await connection.execute('SELECT id FROM outbox_messages WHERE aggregate_id = ?', [wallet.id])).toHaveLength(1);
+      expect(await connection.execute('SELECT id FROM outbox_messages WHERE aggregate_id = ?', [wallet.id])).toHaveLength(2);
     } finally {
       await connection.execute('DROP TRIGGER fail_outbox ON outbox_messages; DROP FUNCTION simulate_outbox_failure();');
     }
@@ -166,5 +167,15 @@ describe('Atomic wagering use case against PostgreSQL', () => {
     expect(results.filter(result => result.status === 'PROCESSED')).toHaveLength(1);
     expect(results.filter(result => result.status === 'REJECTED')).toHaveLength(2);
     await assertReconciled(wallet.id, '20.00');
+  });
+
+  test('infrastructure failure audit cannot overwrite a previously processed transaction', async () => {
+    const { wallet, payload, key } = await scenario();
+    const processed = await submit(payload, key);
+    const audit = await store.recordInfrastructureFailure(payload, key, { correlationId: key });
+    expect(audit.transactionId).toBe(processed.transactionId);
+    expect(audit.status).toBe('PROCESSED');
+    expect(audit.idempotentReplay).toBe(true);
+    await assertReconciled(wallet.id, '75.00');
   });
 });

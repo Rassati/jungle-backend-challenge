@@ -8,7 +8,7 @@ import { Wallet } from '../../domain/wallet';
 import type { WalletLedgerEntry } from '../../domain/ledger-entry';
 import { WagerTransaction, type FailureCode, type WagerKind, type WagerStatus } from '../../domain/wager-transaction';
 import { IntegrationEvent, WalletBalanceChanged, WagerTransactionProcessed,
-  WagerTransactionRejected, WagerTransactionPendingReference } from '../../domain/integration-event';
+  WagerTransactionRejected, WagerTransactionPendingReference, WagerTransactionFailed } from '../../domain/integration-event';
 import { WalletSchema, type WalletRecord } from './config';
 import { Telemetry } from '../../observability';
 import { InboxMessage } from '../../domain/inbox-message';
@@ -59,6 +59,9 @@ export class WageringStore {
           VALUES (?, 'internal', ?, ?, ?, ?, ?, 'opening', 'internal', 'OPENING', ?, ?, 'PROCESSED', ?, ?)`,
         [transactionId, transactionId, `opening:${wallet.id}`, '0'.repeat(64), wallet.id, playerId, money.toString(), money.currency, at, at]);
         await this.saveLedger(em, entry);
+        await this.saveEvent(em, WagerTransactionProcessed.from({ eventId: randomUUID(), aggregateId: wallet.id,
+          correlationId: transactionId, occurredAt: at, data: { transactionId, providerId: 'internal',
+            kind: 'OPENING', status: 'PROCESSED', balance: money.toJSON() } }));
         await this.saveEvent(em, WalletBalanceChanged.from({ eventId: randomUUID(), aggregateId: wallet.id,
           correlationId: transactionId, occurredAt: at, data: this.balanceData(wallet, entry) }));
       }
@@ -67,6 +70,15 @@ export class WageringStore {
   }
 
   async submit(payload: WagerPayload, idempotencyKey: string, context: SubmissionContext): Promise<TransactionResult> {
+    return this.execute(payload, idempotencyKey, context);
+  }
+
+  async recordInfrastructureFailure(payload: WagerPayload, idempotencyKey: string, context: SubmissionContext): Promise<TransactionResult> {
+    return this.execute(payload, idempotencyKey, context, true);
+  }
+
+  private async execute(payload: WagerPayload, idempotencyKey: string, context: SubmissionContext,
+    permanentFailure = false): Promise<TransactionResult> {
     const hash = payloadHash(payload);
     const tx = WagerTransaction.create({ ...payload, id: randomUUID(), idempotencyKey,
       payloadHash: hash, money: Money.from(payload.money), createdAt: new Date() });
@@ -103,7 +115,7 @@ export class WageringStore {
         await this.finishInbox(em, context);
         return { ...previous.result, idempotentReplay: true };
       }
-      const result = await this.applyAndSave(em, record, tx, context);
+      const result = await this.applyAndSave(em, record, tx, context, undefined, permanentFailure);
       await this.finishInbox(em, context);
       return result;
     });
@@ -137,7 +149,7 @@ export class WageringStore {
   }
 
   private async applyAndSave(em: EntityManager, record: WalletRecord, tx: WagerTransaction, context: SubmissionContext,
-    retry?: { attempts: number; maxAttempts: number; now: Date }): Promise<TransactionResult> {
+    retry?: { attempts: number; maxAttempts: number; now: Date }, permanentFailure = false): Promise<TransactionResult> {
       const wallet = Wallet.rehydrate({ ...record, balance: Money.from({ amount: record.balance, currency: record.currency }) });
       const refRow: TransactionRow | undefined = tx.referenceExternalTransactionId
         ? (await em.execute<TransactionRow[]>('SELECT * FROM wager_transactions WHERE provider_id = ? AND external_transaction_id = ?',
@@ -146,7 +158,8 @@ export class WageringStore {
       const reversed = ref && tx.requiresReference() ? (await em.execute(`SELECT id FROM wager_transactions
         WHERE reference_transaction_id = ? AND kind = ? AND status = 'PROCESSED'`, [ref.id, tx.kind])).length > 0 : false;
       const at = retry?.now ?? new Date();
-      const entry = tx.apply(wallet, { entryId: randomUUID(), at }, ref, reversed);
+      if (permanentFailure) tx.fail('INFRASTRUCTURE_FAILURE');
+      const entry = permanentFailure ? undefined : tx.apply(wallet, { entryId: randomUUID(), at }, ref, reversed);
       if (tx.status === 'PENDING_REFERENCE' && retry && retry.attempts >= retry.maxAttempts) tx.reject('REFERENCE_NOT_FOUND');
       if (entry) {
         record.balance = wallet.balance.toString();
@@ -165,7 +178,8 @@ export class WageringStore {
       const props = { eventId: randomUUID(), aggregateId: wallet.id, correlationId: context.correlationId,
         causationId: context.inbox?.messageId, occurredAt: at, data: { ...result, providerId: tx.providerId } };
       const event = tx.status === 'PROCESSED' ? WagerTransactionProcessed.from(props)
-        : tx.status === 'REJECTED' ? WagerTransactionRejected.from(props) : WagerTransactionPendingReference.from(props);
+        : tx.status === 'REJECTED' ? WagerTransactionRejected.from(props)
+        : tx.status === 'FAILED' ? WagerTransactionFailed.from(props) : WagerTransactionPendingReference.from(props);
       if (!retry || tx.status !== 'PENDING_REFERENCE') await this.saveEvent(em, event);
       if (entry) await this.saveEvent(em, WalletBalanceChanged.from({ ...props, eventId: randomUUID(), data: this.balanceData(wallet, entry) }));
       return result;

@@ -27,6 +27,10 @@ export class WagerTransactionRejected extends IntegrationEvent {
   readonly eventType = 'WagerTransactionRejected';
   static from(props: EventProps): WagerTransactionRejected { return new this(props); }
 }
+export class WagerTransactionFailed extends IntegrationEvent {
+  readonly eventType = 'WagerTransactionFailed';
+  static from(props: EventProps): WagerTransactionFailed { return new this(props); }
+}
 export class WagerTransactionPendingReference extends IntegrationEvent {
   readonly eventType = 'WagerTransactionPendingReference';
   static from(props: EventProps): WagerTransactionPendingReference { return new this(props); }

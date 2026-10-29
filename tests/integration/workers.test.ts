@@ -117,6 +117,27 @@ describe('Workers with real SQS and PostgreSQL', () => {
     expect(await telemetry.registry.metrics()).toContain('outbox_lag_seconds 0');
   });
 
+  test('publisher cannot see or send an event before its SQL commit', async () => {
+    await flushOutbox(); await drainEvents();
+    const item = await scenario();
+    await flushOutbox(); await drainEvents();
+    const eventId = randomUUID();
+    const em = orm.em.fork();
+    await em.begin();
+    try {
+      const event = { eventId, aggregateId: item.wallet.id, correlationId: item.key,
+        eventType: 'WalletBalanceChanged', version: 1, occurredAt: new Date().toISOString(), data: {} };
+      await em.execute(`INSERT INTO outbox_messages (id,aggregate_id,event_type,payload,occurred_at)
+        VALUES (?, ?, ?, ?::jsonb, now())`, [eventId, item.wallet.id, event.eventType, JSON.stringify(event)]);
+      expect(await publisher.publishOne()).toBe(false);
+      expect(await drainEvents()).toHaveLength(0);
+      await em.commit();
+    } catch (error) { await em.rollback(); throw error; }
+    expect(await publisher.publishOne()).toBe(true);
+    expect(await drainEvents()).toEqual([eventId]);
+    await reconciled(item.wallet.id, '100.00');
+  });
+
   test('refund before bet is resumed by concurrent reference workers exactly once', async () => {
     const item = await scenario();
     const refund = await store.submit({ ...item.payload, kind: 'REFUND', externalTransactionId: randomUUID(), referenceExternalTransactionId: item.payload.externalTransactionId }, randomUUID(), { correlationId: item.key });
@@ -150,6 +171,37 @@ describe('Workers with real SQS and PostgreSQL', () => {
     for (const message of result.Messages ?? []) await sqs.send(new DeleteMessageCommand({ QueueUrl: dlqUrl, ReceiptHandle: message.ReceiptHandle! }));
   });
 
+  test('business rejection is committed and acked without sending the request to DLQ', async () => {
+    const item = await scenario();
+    item.message.data.money.amount = '101.00';
+    await send(item.message); await consumer.poll();
+    const result = await new Queries(orm).transaction({ providerId: item.payload.providerId, externalId: item.payload.externalTransactionId });
+    expect(result.status).toBe('REJECTED'); expect(result.failureCode).toBe('INSUFFICIENT_FUNDS');
+    const pendingDlq = await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlqUrl, WaitTimeSeconds: 0 }));
+    expect(pendingDlq.Messages ?? []).toHaveLength(0);
+    await reconciled(item.wallet.id, '100.00');
+  });
+
+  test('exhausted infrastructure failures are auditable as FAILED without financial effects', async () => {
+    const item = await scenario();
+    const connection = orm.em.getConnection();
+    await connection.execute(`CREATE FUNCTION fail_processed_event() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.event_type = 'WagerTransactionProcessed' THEN RAISE EXCEPTION 'simulated permanent storage failure'; END IF; RETURN NEW; END; $$;
+      CREATE TRIGGER fail_processed_event BEFORE INSERT ON outbox_messages FOR EACH ROW EXECUTE FUNCTION fail_processed_event();`);
+    try {
+      await send(item.message);
+      await new QueueConsumer(sqs, inputUrl, dlqUrl, store, telemetry, { waitSeconds: 0, maxAttempts: 1 }).poll();
+      const result = await new Queries(orm).transaction({ providerId: item.payload.providerId, externalId: item.payload.externalTransactionId });
+      expect(result.status).toBe('FAILED'); expect(result.failureCode).toBe('INFRASTRUCTURE_FAILURE');
+      expect(await connection.execute("SELECT id FROM outbox_messages WHERE aggregate_id = ? AND event_type = 'WagerTransactionFailed'", [item.wallet.id])).toHaveLength(1);
+      expect(await connection.execute("SELECT id FROM wallet_ledger_entries WHERE wallet_id = ? AND direction = 'DEBIT'", [item.wallet.id])).toHaveLength(0);
+      await reconciled(item.wallet.id, '100.00');
+      const dlq = await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlqUrl, WaitTimeSeconds: 0 }));
+      expect(dlq.Messages).toHaveLength(1);
+      for (const message of dlq.Messages ?? []) await sqs.send(new DeleteMessageCommand({ QueueUrl: dlqUrl, ReceiptHandle: message.ReceiptHandle! }));
+    } finally { await connection.execute('DROP TRIGGER fail_processed_event ON outbox_messages; DROP FUNCTION fail_processed_event();'); }
+  });
+
   test('unavailable wallet retries then reaches bounded DLQ', async () => {
     const item = await scenario(); item.message.data.walletId = randomUUID();
     await send(item.message); await consumer.poll();
@@ -180,9 +232,9 @@ describe('Workers with real SQS and PostgreSQL', () => {
     await killAfterWork('publisher');
     await flushOutbox();
     const ids = await drainEvents();
-    const row = (await orm.em.getConnection().execute('SELECT id,published_at FROM outbox_messages WHERE aggregate_id = ?', [item.wallet.id]))[0];
-    expect(row?.published_at).not.toBeNull();
-    expect(ids).toEqual([row?.id]);
+    const rows = await orm.em.getConnection().execute('SELECT id,published_at FROM outbox_messages WHERE aggregate_id = ?', [item.wallet.id]);
+    expect(rows.every(row => row.published_at !== null)).toBe(true);
+    expect(ids.sort()).toEqual(rows.map(row => row.id).sort());
     await reconciled(item.wallet.id, '100.00');
   });
 
@@ -190,10 +242,12 @@ describe('Workers with real SQS and PostgreSQL', () => {
     await flushOutbox(); await drainEvents();
     const item = await scenario();
     await new OutboxPublisher(orm, sqs, `${eventsUrl}-missing`, telemetry).publishOne();
-    const row = (await orm.em.getConnection().execute('SELECT attempts,published_at,next_attempt_at FROM outbox_messages WHERE aggregate_id = ?', [item.wallet.id]))[0];
+    const row = (await orm.em.getConnection().execute('SELECT attempts,published_at,next_attempt_at FROM outbox_messages WHERE aggregate_id = ? AND attempts = 1', [item.wallet.id]))[0];
     expect(row?.attempts).toBe(1); expect(row?.published_at).toBeNull();
-    await new OutboxPublisher(orm, sqs, eventsUrl).publishOne(new Date(Date.now() + 5000));
-    expect((await drainEvents()).length).toBe(1);
+    const restarted = new OutboxPublisher(orm, sqs, eventsUrl);
+    await restarted.publishOne(new Date(Date.now() + 5000));
+    await restarted.publishOne(new Date(Date.now() + 5000));
+    expect((await drainEvents()).length).toBe(2);
   });
 
   test('stopped consumer does not acquire new work', async () => {

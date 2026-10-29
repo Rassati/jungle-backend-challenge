@@ -26,7 +26,7 @@ Docker Compose inicia PostgreSQL e LocalStack com SQS. Portas publicadas apenas 
 
 Interpretação de valores: LOSS exige zero, operações financeiras exigem valor positivo. Reversões são integrais. REFUND e ROLLBACK podem cada um reverter uma mesma referência uma vez, conforme a regra de unicidade por tipo do enunciado. Não se exige gameId igual na referência, pois a regra explícita exige provider, player, wallet, moeda e rodada.
 
-Taxonomia inicial de rejeições: INSUFFICIENT_FUNDS (aposta sem saldo), REVERSAL_INSUFFICIENT_FUNDS (reversão sem saldo), WALLET_MISMATCH, CURRENCY_MISMATCH, REFERENCE_MISMATCH, INVALID_REFERENCE_KIND, REFERENCE_NOT_PROCESSED, REFERENCE_AMOUNT_MISMATCH, ALREADY_REVERSED, REFERENCE_NOT_FOUND (expiração da espera), AMOUNT_OUT_OF_RANGE. INFRASTRUCTURE_FAILURE fica reservado para falha permanente auditável.
+Taxonomia de rejeições: INSUFFICIENT_FUNDS (aposta sem saldo), REVERSAL_INSUFFICIENT_FUNDS (reversão sem saldo), WALLET_MISMATCH, CURRENCY_MISMATCH, REFERENCE_MISMATCH, INVALID_REFERENCE_KIND, REFERENCE_NOT_PROCESSED, REFERENCE_AMOUNT_MISMATCH, ALREADY_REVERSED, REFERENCE_NOT_FOUND (expiração da espera), AMOUNT_OUT_OF_RANGE. INFRASTRUCTURE_FAILURE identifica uma falha de infraestrutura que esgotou as tentativas: quando a persistência está acessível, a operação fica FAILED e gera WagerTransactionFailed, sem lançamento financeiro. A auditoria usa as mesmas constraints e nunca sobrescreve um resultado confirmado. Se o banco não puder gravar nem mesmo a falha, a DLQ preserva o pedido para investigação posterior.
 
 ## Implementado: identificação do payload
 
@@ -38,9 +38,11 @@ MikroORM 6.6 com metadata de persistência separada do domínio. Valor monetári
 
 O schema protege saldo não-negativo, carteira única por player/moeda, chave de idempotência global, identificador externo único por provedor, lançamento único por transação/carteira e reversão processada única por referência/tipo. Chaves estrangeiras compostas alinham carteira e moeda dos registros. CHECK valida a aritmética do ledger; triggers proíbem UPDATE, DELETE e TRUNCATE do ledger e UPDATE de transações terminais. O administrador do banco ainda pode alterar o schema: a proteção pressupõe uma aplicação que não modifica DDL em operação normal.
 
+A segunda migration exige referência interna resolvida para REFUND/ROLLBACK em estado PROCESSED. Ambas as migrations têm reversão testada; a alteração posterior não reescreve o histórico da migration inicial.
+
 ## Implementado: caso de uso e concorrência
 
-`WageringStore` usa `EntityManager.transactional()` e `LockMode.PESSIMISTIC_WRITE` para bloquear a carteira antes de calcular o novo saldo. Carteira, resultado da operação, ledger, inbox e outbox são confirmados juntos. Carteiras distintas usam bloqueios independentes. Abertura com saldo positivo grava OPENING, lançamento e evento de alteração do saldo na mesma transação.
+`WageringStore` usa `EntityManager.transactional()` e `LockMode.PESSIMISTIC_WRITE` para bloquear a carteira antes de calcular o novo saldo. Carteira, resultado da operação, ledger, inbox e outbox são confirmados juntos. Carteiras distintas usam bloqueios independentes. Abertura com saldo positivo grava OPENING, lançamento e os eventos WagerTransactionProcessed e WalletBalanceChanged na mesma transação.
 
 INSERT com ON CONFLICT e as constraints do schema arbitram duplicações. A mesma chave e mesmo hash devolvem o resultado salvo, inclusive saldo histórico. A mesma chave com outro hash ou o mesmo identificador externo com outra chave são conflitos. Chaves de idempotência são globais; recomenda-se prefixá-las pelo provedor. A abertura de carteira repetida é conflito.
 
@@ -57,6 +59,8 @@ Tentativas e próxima data de publicação são persistidas, com espera exponenc
 QueueConsumer valida o mesmo contrato de entrada da API. Mensagens internas não exigem autenticação, mas providerId e demais campos continuam validados. Heartbeat renova a visibilidade durante o processamento. Sucesso e rejeição de negócio persistida resultam em ack após commit. Mensagens inválidas e conflitos permanentes são enviadas à DLQ; falhas transitórias aguardam backoff e têm no máximo cinco recebimentos antes da DLQ. Envio para DLQ precede exclusão na origem e preserva o corpo para diagnóstico. Se houver queda entre as duas ações, a DLQ pode receber duplicatas, identificáveis pelo messageId; isso não reaplica efeitos financeiros.
 
 Referências pendentes têm próximo horário e contador persistidos. ReferenceWorker lista até 20 candidatas por segundo; cada tentativa bloqueia primeiro a carteira e depois revalida estado e horário da transação. Processos que perderem a corrida não reaplicam a operação. A espera inicial é 1 segundo e dobra até o teto de 300 segundos. Após até 12 reprocessamentos sem referência processável, a operação é rejeitada com REFERENCE_NOT_FOUND e evento correspondente. Reiniciar o processo preserva a agenda. Uma referência válida ainda é aplicada na última tentativa antes de decidir a expiração.
+
+Esse limite oferece aproximadamente 24 minutos de espera, além do tempo de execução/carga, para absorver atrasos temporários sem manter operações pendentes indefinidamente. A janela seria ajustada com o SLA real dos provedores; falhas de infraestrutura que impedem o commit de uma tentativa não consomem o contador persistido.
 
 SIGTERM/SIGINT fecham a API, interrompem a aquisição e aguardam iterações em andamento antes de fechar os clientes. Caso uma mensagem seja recebida durante a parada, sua visibilidade é devolvida. Timeout de conexão de banco é 5 segundos; queries e statements têm limite de 10 segundos e locks financeiros de 5 segundos. O Compose concede 30 segundos de encerramento e executa Bun diretamente como PID 1.
 
@@ -76,7 +80,7 @@ ProviderIdentityGuard é um ponto de extensão explícito sem autenticação rea
 
 ## Validação disponível nesta etapa
 
-100 testes passam em Windows/Bun e Linux/Docker, além da checagem estática. PostgreSQL real: mapeamento monetário, constraints, imutabilidade, migrations reversíveis, 50 reenvios paralelos com um débito, disputa por saldo, três processos Bun, carteiras independentes, replay histórico, reversões concorrentes, inbox e rollback financeiro quando a outbox falha. HTTP: contratos, status, consultas, cursor, reconciliação e dependências indisponíveis. SQS real via LocalStack: redelivery, publicadores concorrentes, retry/DLQ, referências fora de ordem/expiração, processo morto após commit antes do ack e publicador morto após enviar antes de marcar sucesso. Novas conexões/processos retomam o trabalho e a reconciliação verifica o saldo final.
+106 testes, além da checagem estática. PostgreSQL real: mapeamento monetário, constraints, imutabilidade, migrations reversíveis, 50 reenvios paralelos com um débito, disputa por saldo, três processos Bun, carteiras independentes, replay histórico, reversões concorrentes, inbox e rollback financeiro quando a outbox falha. HTTP: contratos, status, consultas, cursor (inclusive datas impossíveis), reconciliação e dependências indisponíveis. SQS real via LocalStack: redelivery, publicadores concorrentes, retry/DLQ, auditoria FAILED, referências fora de ordem/expiração, processo morto após commit antes do ack e publicador morto após enviar antes de marcar sucesso. Uma transação SQL aberta comprova que a outbox não é publicada antes do commit. Novas conexões/processos retomam o trabalho e a reconciliação verifica o saldo final.
 
 ## Limitações e opcionais
 

@@ -2,6 +2,7 @@ import { EntitySchema } from '@mikro-orm/core';
 import { Migrator } from '@mikro-orm/migrations';
 import { defineConfig } from '@mikro-orm/postgresql';
 import { Migration202610290001 } from './migrations/Migration202610290001';
+import { Migration202610290002 } from './migrations/Migration202610290002';
 
 export interface WalletRecord {
   id: string;
@@ -33,7 +34,7 @@ export function databaseConfig(clientUrl = process.env.DATABASE_URL ??
     clientUrl,
     entities: [WalletSchema],
     extensions: [Migrator],
-    migrations: { migrationsList: [Migration202610290001], transactional: true, allOrNothing: true },
+    migrations: { migrationsList: [Migration202610290001, Migration202610290002], transactional: true, allOrNothing: true },
     pool: { min: 0, max: 10 },
     driverOptions: { connection: { connectionTimeoutMillis: 5000, query_timeout: 10000, statement_timeout: 10000 } },
   });

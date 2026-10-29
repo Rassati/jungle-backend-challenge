@@ -38,8 +38,9 @@ export class QueueConsumer {
       .catch(() => log({ level: 'error', event: 'visibility_extension_failed', messageId: message.MessageId })); }, Math.max(200, seconds * 1000 / 3));
     let fields: Record<string, unknown> = { correlationId: message.MessageId, messageId: message.MessageId,
       transactionId: null, walletId: null, providerId: null };
+    let parsed: z.infer<typeof envelope> | undefined;
     try {
-      const parsed = envelope.parse(JSON.parse(message.Body ?? ''));
+      parsed = envelope.parse(JSON.parse(message.Body ?? ''));
       const { idempotencyKey, ...payload } = parsed.data;
       fields = { ...fields, messageId: parsed.messageId, correlationId: parsed.correlationId ?? parsed.messageId,
         walletId: payload.walletId, providerId: payload.providerId };
@@ -56,6 +57,18 @@ export class QueueConsumer {
       const permanent = error instanceof ZodError || error instanceof SyntaxError ||
         (error instanceof DomainError && error.code !== 'WALLET_NOT_FOUND');
       if (permanent || attempt >= (this.options.maxAttempts ?? 5)) {
+        // Never overwrite a committed result; the same idempotency rules apply to audit.
+        if (!permanent && parsed && !(error instanceof DomainError)) {
+          const { idempotencyKey, ...payload } = parsed.data;
+          try {
+            const audit = await this.store.recordInfrastructureFailure(payload, idempotencyKey, {
+              correlationId: String(fields.correlationId), inbox: { consumerName: 'wager-consumer-v1', messageId: parsed.messageId } });
+            fields.transactionId = audit.transactionId;
+          } catch {
+            // If PostgreSQL itself is unavailable, DLQ preserves the request for investigation.
+            log({ level: 'error', event: 'failure_audit_unavailable', ...fields });
+          }
+        }
         await this.sqs.send(new SendMessageCommand({ QueueUrl: this.dlqUrl, MessageBody: message.Body ?? '{}',
           MessageGroupId: message.Attributes?.MessageGroupId ?? 'invalid',
           MessageDeduplicationId: createHash('sha256').update(`dlq:${message.MessageId}`).digest('hex') }));

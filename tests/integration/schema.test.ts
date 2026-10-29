@@ -86,10 +86,24 @@ describe('PostgreSQL schema and migrations', () => {
   });
 
   test('migration can be reversed and reapplied in the isolated test database', async () => {
-    await orm.getMigrator().down();
+    await orm.getMigrator().down({ to: 0 });
     const connection = orm.em.getConnection();
     expect((await connection.execute("SELECT to_regclass('wallets') AS name"))[0]?.name).toBeNull();
     await orm.getMigrator().up();
     expect((await connection.execute("SELECT to_regclass('wallets') AS name"))[0]?.name).toBe('wallets');
+  });
+
+  test('database forbids a processed reversal without a resolved reference', async () => {
+    const id = randomUUID();
+    let failure: unknown;
+    try {
+      await orm.em.getConnection().execute(`INSERT INTO wallets VALUES (?, ?, 'BRL', 0, 1, now(), now())`, [id, randomUUID()]);
+      const player = (await orm.em.getConnection().execute('SELECT player_id FROM wallets WHERE id = ?', [id]))[0];
+      await orm.em.getConnection().execute(`INSERT INTO wager_transactions
+        (id,provider_id,external_transaction_id,idempotency_key,payload_hash,wallet_id,player_id,round_id,game_id,kind,amount,currency,status,reference_external_transaction_id,created_at,processed_at)
+        VALUES (?, 'provider', ?, ?, ?, ?, ?, 'round', 'game', 'REFUND', 1, 'BRL', 'PROCESSED', 'missing', now(), now())`,
+      [randomUUID(), randomUUID(), randomUUID(), 'a'.repeat(64), id, player?.player_id]);
+    } catch (error) { failure = error; }
+    expect(failure).toHaveProperty('code', '23514');
   });
 });

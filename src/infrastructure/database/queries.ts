@@ -32,7 +32,8 @@ export class Queries {
         const decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString());
         if (decoded.walletId !== walletId || typeof decoded.time !== 'string' ||
           !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(decoded.time) ||
-          Number.isNaN(Date.parse(decoded.time)) || typeof decoded.id !== 'string' ||
+          Number.isNaN(Date.parse(decoded.time)) || decoded.time.startsWith('0000-') ||
+          new Date(decoded.time).toISOString().slice(0, 23) !== decoded.time.slice(0, 23) || typeof decoded.id !== 'string' ||
           !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(decoded.id)) throw new Error();
         point = decoded;
       } catch { throw new DomainError('INVALID_CURSOR', 'Cursor is invalid for this wallet.'); }

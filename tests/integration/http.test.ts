@@ -124,6 +124,13 @@ describe('HTTP API with real PostgreSQL and LocalStack', () => {
     expect(await (await request('/metrics')).text()).toContain('wallet_reconciliation_mismatches_total 1');
   });
 
+  test('impossible calendar dates in a ledger cursor are invalid input', async () => {
+    const cursor = Buffer.from(JSON.stringify({ walletId, time: '2026-02-30T12:00:00.000000Z', id: randomUUID() })).toString('base64url');
+    const response = await request(`/wallets/${walletId}/ledger?cursor=${cursor}`);
+    expect(response.status).toBe(400);
+    expect(await json<{ code: string }>(response)).toHaveProperty('code', 'INVALID_CURSOR');
+  });
+
   test('invalid UUID is 400; missing resource is 404', async () => {
     expect((await request('/wallets/not-a-uuid')).status).toBe(400);
     expect((await request(`/wallets/${randomUUID()}`)).status).toBe(404);

@@ -64,7 +64,7 @@ bun run test:integration
 
 A suíte cria um banco temporário com nome aleatório, aplica as migrations e remove somente esse banco ao terminar. O banco padrão é acessado em `localhost:55432`. Para outro ambiente, configure `DATABASE_URL` para a aplicação e `TEST_ADMIN_DATABASE_URL` para a conexão autorizada a criar bancos de teste.
 
-`bun run db:rollback` reverte a última migration e remove as tabelas criadas por ela; use apenas quando a perda desses dados for intencional. Os testes de reversibilidade executam essa operação apenas no banco temporário.
+`bun run db:rollback` reverte a última migration e remove os objetos criados por ela. Reverter a criação das tabelas elimina seus dados; use apenas quando isso for intencional. Os testes de reversibilidade executam essa operação apenas no banco temporário.
 
 ## Executar e testar a API
 
@@ -104,6 +104,8 @@ Os endpoints estão sem autenticação nesta entrega incremental. `ProviderIdent
 
 O consumidor valida o envelope da seção 10 do desafio e reutiliza o processamento da API. Confirma a mensagem somente após o commit; o inbox persistente usa `(consumerName,messageId)`. Visibilidade de 30 segundos é renovada enquanto o processamento está em andamento. Erros de negócio registrados são confirmados. Mensagens inválidas vão para DLQ; falhas transitórias usam intervalos crescentes e chegam à DLQ após cinco recebimentos. A confirmação de envio para DLQ precede a exclusão da origem.
 
+Quando falhas de infraestrutura esgotam as tentativas e o banco está disponível, a operação é registrada como `FAILED/INFRASTRUCTURE_FAILURE`, sem alteração de saldo, com inbox e evento `WagerTransactionFailed`. Um resultado anteriormente confirmado nunca é sobrescrito por essa auditoria. Se o próprio banco estiver indisponível, a mensagem preservada na DLQ permanece como evidência para investigação/reenvio.
+
 O publicador seleciona um evento por transação com `FOR UPDATE SKIP LOCKED`. Mantém a reserva enquanto envia ao SQS com timeout; depois marca o evento publicado. Em falha, registra a tentativa e uma nova data no banco. Publicação pode ser repetida após queda entre envio e commit: `eventId` é estável e o consumidor de saída deve deduplicá-lo persistentemente. A deduplicação FIFO é apenas uma proteção adicional.
 
 Referências pendentes são verificadas a cada segundo, em lotes de até 20. O banco armazena tentativas e próximo horário. A espera começa em 1 segundo, dobra e é limitada a 300 segundos; há até 12 reprocessamentos. Referência ainda ausente ao final gera REJECTED/REFERENCE_NOT_FOUND e evento de rejeição. O worker bloqueia primeiro a carteira e revalida o estado para impedir reprocessamento duplicado entre instâncias.
@@ -114,4 +116,4 @@ SIGTERM/SIGINT interrompem a aquisição de mensagens e aguardam trabalho em and
 
 `/metrics` expõe estados das operações, duplicatas, tentativas por subsistema, mensagens encaminhadas à DLQ, conflitos de lock, atraso da outbox, latência de processamento, latência HTTP e divergências de reconciliação. Identificadores individuais ficam nos logs, não nos rótulos das métricas.
 
-Validação atual: 100 testes passam em Windows/Bun e Linux/Docker, com PostgreSQL e LocalStack reais, além da checagem de tipos. A suíte inclui encerramento forçado após commit/antes do ack, publicação interrompida, publicadores concorrentes, referências fora de ordem e recuperação por novas conexões/processos.
+Validação: 106 testes, com PostgreSQL e LocalStack reais, além da checagem de tipos. A suíte inclui encerramento forçado após commit/antes do ack, publicação interrompida, publicadores concorrentes, referências fora de ordem e recuperação por novas conexões/processos. A publicação anterior ao commit é verificada explicitamente. O mapeamento entre requisitos, código e testes está em [REQUIREMENTS.md](REQUIREMENTS.md).
