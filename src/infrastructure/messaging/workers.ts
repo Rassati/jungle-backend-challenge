@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { setTimeout as pause } from 'node:timers/promises';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { ChangeMessageVisibilityCommand, DeleteMessageCommand, ReceiveMessageCommand, SendMessageCommand,
   type Message, type SQSClient } from '@aws-sdk/client-sqs';
@@ -8,6 +9,8 @@ import { DomainError } from '../../domain/errors';
 import { OutboxMessage } from '../../domain/outbox-message';
 import { log, Telemetry } from '../../observability';
 import { identifier, wagerInput } from '../../application/contracts';
+
+const ACK_MAX_ATTEMPTS = 3;
 
 const envelope = z.strictObject({ messageId: identifier, type: z.literal('WagerTransactionRequested'),
   occurredAt: z.iso.datetime({ offset: true }), correlationId: identifier.optional(),
@@ -36,52 +39,85 @@ export class QueueConsumer {
     let heartbeat: Promise<unknown> = Promise.resolve();
     const timer = setInterval(() => { heartbeat = heartbeat.then(() => this.visibility(message, seconds))
       .catch(() => log({ level: 'error', event: 'visibility_extension_failed', messageId: message.MessageId })); }, Math.max(200, seconds * 1000 / 3));
+    const stopHeartbeat = async () => { clearInterval(timer); await heartbeat; };
     let fields: Record<string, unknown> = { correlationId: message.MessageId, messageId: message.MessageId,
       transactionId: null, walletId: null, providerId: null };
     let parsed: z.infer<typeof envelope> | undefined;
     try {
-      parsed = envelope.parse(JSON.parse(message.Body ?? ''));
-      const { idempotencyKey, ...payload } = parsed.data;
-      fields = { ...fields, messageId: parsed.messageId, correlationId: parsed.correlationId ?? parsed.messageId,
-        walletId: payload.walletId, providerId: payload.providerId };
-      const result = await this.store.submit(payload, idempotencyKey, { correlationId: String(fields.correlationId),
-        inbox: { consumerName: 'wager-consumer-v1', messageId: parsed.messageId } });
-      fields.transactionId = result.transactionId;
-      await this.options.afterCommit?.();
-      clearInterval(timer); await heartbeat;
-      await this.sqs.send(new DeleteMessageCommand({ QueueUrl: this.inputUrl, ReceiptHandle: message.ReceiptHandle }));
-      log({ level: 'info', event: 'message_committed', ...fields, status: result.status, idempotentReplay: result.idempotentReplay });
-    } catch (error) {
-      clearInterval(timer); await heartbeat;
-      const attempt = Number(message.Attributes?.ApproximateReceiveCount ?? 1);
-      const permanent = error instanceof ZodError || error instanceof SyntaxError ||
-        (error instanceof DomainError && error.code !== 'WALLET_NOT_FOUND');
-      if (permanent || attempt >= (this.options.maxAttempts ?? 5)) {
-        // Never overwrite a committed result; the same idempotency rules apply to audit.
-        if (!permanent && parsed && !(error instanceof DomainError)) {
-          const { idempotencyKey, ...payload } = parsed.data;
-          try {
-            const audit = await this.store.recordInfrastructureFailure(payload, idempotencyKey, {
-              correlationId: String(fields.correlationId), inbox: { consumerName: 'wager-consumer-v1', messageId: parsed.messageId } });
-            fields.transactionId = audit.transactionId;
-          } catch {
-            // If PostgreSQL itself is unavailable, DLQ preserves the request for investigation.
-            log({ level: 'error', event: 'failure_audit_unavailable', ...fields });
-          }
-        }
-        await this.sqs.send(new SendMessageCommand({ QueueUrl: this.dlqUrl, MessageBody: message.Body ?? '{}',
-          MessageGroupId: message.Attributes?.MessageGroupId ?? 'invalid',
-          MessageDeduplicationId: createHash('sha256').update(`dlq:${message.MessageId}`).digest('hex') }));
-        await this.sqs.send(new DeleteMessageCommand({ QueueUrl: this.inputUrl, ReceiptHandle: message.ReceiptHandle }));
-        this.telemetry.dlq.inc();
-        log({ level: 'error', event: 'message_dlq', ...fields, attempt, code: error instanceof DomainError ? error.code : 'MESSAGE_FAILURE' });
-      } else {
-        this.telemetry.retries.inc({ subsystem: 'consumer' });
-        await this.visibility(message, Math.min(60, 2 ** attempt));
-        log({ level: 'warn', event: 'message_retry', ...fields, attempt });
+      let result: Awaited<ReturnType<WageringStore['submit']>>;
+      try {
+        parsed = envelope.parse(JSON.parse(message.Body ?? ''));
+        const { idempotencyKey, ...payload } = parsed.data;
+        fields = { ...fields, messageId: parsed.messageId, correlationId: parsed.correlationId ?? parsed.messageId,
+          walletId: payload.walletId, providerId: payload.providerId };
+        result = await this.store.submit(payload, idempotencyKey, { correlationId: String(fields.correlationId),
+          inbox: { consumerName: 'wager-consumer-v1', messageId: parsed.messageId } });
+        fields.transactionId = result.transactionId;
+      } catch (error) {
+        await this.handleProcessingFailure(message, parsed, fields, error, stopHeartbeat);
+        return true;
       }
-    } finally { clearInterval(timer); await heartbeat; }
+      await this.options.afterCommit?.();
+      log({ level: 'info', event: 'message_committed', ...fields, status: result.status, idempotentReplay: result.idempotentReplay });
+      // ACK failures are handled separately and never enter financial failure handling.
+      await this.acknowledge(message, { ...fields, disposition: 'committed' });
+    } finally { await stopHeartbeat(); }
     return true;
+  }
+
+  private async handleProcessingFailure(message: Message, parsed: z.infer<typeof envelope> | undefined,
+    fields: Record<string, unknown>, error: unknown, stopHeartbeat: () => Promise<void>): Promise<void> {
+    const attempt = Number(message.Attributes?.ApproximateReceiveCount ?? 1);
+    const permanent = error instanceof ZodError || error instanceof SyntaxError ||
+      (error instanceof DomainError && error.code !== 'WALLET_NOT_FOUND');
+    if (permanent || attempt >= (this.options.maxAttempts ?? 5)) {
+      // Never overwrite a committed result; the same idempotency rules apply to audit.
+      if (!permanent && parsed && !(error instanceof DomainError)) {
+        const { idempotencyKey, ...payload } = parsed.data;
+        try {
+          const audit = await this.store.recordInfrastructureFailure(payload, idempotencyKey, {
+            correlationId: String(fields.correlationId), inbox: { consumerName: 'wager-consumer-v1', messageId: parsed.messageId } });
+          fields.transactionId = audit.transactionId;
+        } catch {
+          // If PostgreSQL itself is unavailable, DLQ preserves the request for investigation.
+          log({ level: 'error', event: 'failure_audit_unavailable', ...fields });
+        }
+      }
+      await this.sqs.send(new SendMessageCommand({ QueueUrl: this.dlqUrl, MessageBody: message.Body ?? '{}',
+        MessageGroupId: message.Attributes?.MessageGroupId ?? 'invalid',
+        MessageDeduplicationId: createHash('sha256').update(`dlq:${message.MessageId}`).digest('hex') }));
+      this.telemetry.dlq.inc();
+      log({ level: 'error', event: 'message_dlq', ...fields, attempt, code: error instanceof DomainError ? error.code : 'MESSAGE_FAILURE' });
+      await this.acknowledge(message, { ...fields, disposition: 'dlq' });
+    } else {
+      this.telemetry.retries.inc({ subsystem: 'consumer' });
+      // Stop the heartbeat before scheduling the next delivery, so it cannot extend the retry delay.
+      await stopHeartbeat();
+      await this.visibility(message, Math.min(60, 2 ** attempt));
+      log({ level: 'warn', event: 'message_retry', ...fields, attempt });
+    }
+  }
+
+  private async acknowledge(message: Message, fields: Record<string, unknown>): Promise<void> {
+    for (let attempt = 1; attempt <= ACK_MAX_ATTEMPTS; attempt++) {
+      try {
+        await this.sqs.send(new DeleteMessageCommand({ QueueUrl: this.inputUrl, ReceiptHandle: message.ReceiptHandle! }),
+          { abortSignal: AbortSignal.timeout(5000) });
+        log({ level: 'info', event: 'message_acknowledged', ...fields, attempt });
+        return;
+      } catch (error) {
+        this.telemetry.ackFailures.inc();
+        const errorName = error instanceof Error ? error.name : 'UnknownError';
+        // An expired handle must be replaced by the handle from the next delivery.
+        const staleHandle = errorName === 'ReceiptHandleIsInvalid' || errorName === 'InvalidParameterValue';
+        log({ level: 'warn', event: 'message_ack_failed', ...fields, attempt, errorName });
+        if (staleHandle || attempt === ACK_MAX_ATTEMPTS) break;
+        this.telemetry.retries.inc({ subsystem: 'ack' });
+        await pause(100 * 2 ** (attempt - 1));
+      }
+    }
+    // Keep the committed result. Redelivery will replay it and use a new ReceiptHandle.
+    log({ level: 'error', event: 'message_ack_deferred', ...fields });
   }
 
   private async visibility(message: Message, seconds: number): Promise<void> {

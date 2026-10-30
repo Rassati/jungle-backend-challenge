@@ -53,6 +53,27 @@ async function scenario() {
 async function send(message: unknown, group = randomUUID()) {
   await sqs.send(new SendMessageCommand({ QueueUrl: inputUrl, MessageBody: JSON.stringify(message), MessageGroupId: group, MessageDeduplicationId: randomUUID() }));
 }
+function failingAcknowledgements(failures: number, afterSend = false, errorName = 'TimeoutError') {
+  const client = createSqs();
+  const handles: string[] = [];
+  // Only inject the transport fault. Database work and other SQS calls remain real.
+  client.middlewareStack.add((next, context) => async args => {
+    if (context.commandName !== 'DeleteMessageCommand') return next(args);
+    handles.push((args.input as { ReceiptHandle: string }).ReceiptHandle);
+    if (handles.length > failures) return next(args);
+    if (afterSend) await next(args);
+    throw Object.assign(new Error('Injected ACK transport failure'), { name: errorName });
+  }, { step: 'initialize', name: 'ackFaultInjection' });
+  return { client, handles };
+}
+async function pollRedelivery(worker: QueueConsumer): Promise<void> {
+  const deadline = Date.now() + 5000;
+  do {
+    if (await worker.poll()) return;
+    await pause(100);
+  } while (Date.now() < deadline);
+  throw new Error('Committed message was not redelivered before the deadline');
+}
 async function reconciled(walletId: string, amount: string) {
   const result = await new Queries(orm).reconciliation(walletId);
   expect(result.consistent).toBe(true); expect(result.storedBalance.amount).toBe(amount);
@@ -106,6 +127,103 @@ describe('Workers with real SQS and PostgreSQL', () => {
     expect(await orm.em.getConnection().execute('SELECT message_id FROM inbox_messages WHERE message_id = ?', [item.message.messageId])).toHaveLength(1);
     const empty = await sqs.send(new ReceiveMessageCommand({ QueueUrl: inputUrl, WaitTimeSeconds: 0 }));
     expect(empty.Messages ?? []).toHaveLength(0);
+  });
+
+  test('transient ACK failures retry deletion without failing or dead-lettering a committed bet', async () => {
+    const item = await scenario();
+    const fault = failingAcknowledgements(2);
+    const metrics = new Telemetry();
+    try {
+      await send(item.message);
+      await new QueueConsumer(fault.client, inputUrl, dlqUrl, store, metrics, { waitSeconds: 0, maxAttempts: 1 }).poll();
+      expect(fault.handles).toHaveLength(3);
+      expect(new Set(fault.handles).size).toBe(1);
+      const result = await new Queries(orm).transaction({ providerId: item.payload.providerId, externalId: item.payload.externalTransactionId });
+      expect(result.status).toBe('PROCESSED');
+      expect(await orm.em.getConnection().execute("SELECT id FROM outbox_messages WHERE aggregate_id = ? AND event_type = 'WagerTransactionFailed'", [item.wallet.id])).toHaveLength(0);
+      expect((await sqs.send(new ReceiveMessageCommand({ QueueUrl: inputUrl, WaitTimeSeconds: 0 }))).Messages ?? []).toHaveLength(0);
+      expect((await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlqUrl, WaitTimeSeconds: 0 }))).Messages ?? []).toHaveLength(0);
+      expect(await metrics.registry.metrics()).toContain('wager_ack_failures_total 2');
+      expect(await metrics.registry.metrics()).toContain('wager_retries_total{subsystem="ack"} 2');
+      expect(await metrics.registry.metrics()).toContain('wager_dlq_total 0');
+      await reconciled(item.wallet.id, '75.00');
+    } finally { fault.client.destroy(); }
+  });
+
+  test('exhausted ACK retries survive restart and redelivery with a fresh handle and one financial effect', async () => {
+    const item = await scenario();
+    const fault = failingAcknowledgements(3);
+    const metrics = new Telemetry();
+    try {
+      await send(item.message);
+      await new QueueConsumer(fault.client, inputUrl, dlqUrl, store, metrics,
+        { waitSeconds: 0, visibilitySeconds: 1, maxAttempts: 1 }).poll();
+      expect(fault.handles).toHaveLength(3);
+      expect((await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlqUrl, WaitTimeSeconds: 0 }))).Messages ?? []).toHaveLength(0);
+      const eventsBefore = await orm.em.getConnection().execute('SELECT id FROM outbox_messages WHERE aggregate_id = ? ORDER BY id', [item.wallet.id]);
+      const balanceBefore = await orm.em.getConnection().execute('SELECT balance,version FROM wallets WHERE id = ?', [item.wallet.id]);
+      const restarted = await MikroORM.init(databaseConfig(databaseUrl));
+      try {
+        await pollRedelivery(new QueueConsumer(fault.client, inputUrl, dlqUrl, new WageringStore(restarted), metrics,
+          { waitSeconds: 0, maxAttempts: 1 }));
+      } finally { await restarted.close(true); }
+      expect(fault.handles).toHaveLength(4);
+      expect(fault.handles[3]).not.toBe(fault.handles[0]);
+      expect(await orm.em.getConnection().execute('SELECT balance,version FROM wallets WHERE id = ?', [item.wallet.id])).toEqual(balanceBefore);
+      expect(await orm.em.getConnection().execute('SELECT id FROM outbox_messages WHERE aggregate_id = ? ORDER BY id', [item.wallet.id])).toEqual(eventsBefore);
+      expect(await orm.em.getConnection().execute("SELECT id FROM wallet_ledger_entries WHERE wallet_id = ? AND direction = 'DEBIT'", [item.wallet.id])).toHaveLength(1);
+      expect(await orm.em.getConnection().execute('SELECT message_id FROM inbox_messages WHERE message_id = ?', [item.message.messageId])).toHaveLength(1);
+      expect((await sqs.send(new ReceiveMessageCommand({ QueueUrl: inputUrl, WaitTimeSeconds: 0 }))).Messages ?? []).toHaveLength(0);
+      expect((await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlqUrl, WaitTimeSeconds: 0 }))).Messages ?? []).toHaveLength(0);
+      expect(await metrics.registry.metrics()).toContain('wager_ack_failures_total 3');
+      await reconciled(item.wallet.id, '75.00');
+    } finally { fault.client.destroy(); }
+  });
+
+  test('lost ACK response after SQS deletion preserves the committed result without DLQ', async () => {
+    const item = await scenario();
+    const fault = failingAcknowledgements(1, true);
+    try {
+      await send(item.message);
+      await new QueueConsumer(fault.client, inputUrl, dlqUrl, store, undefined, { waitSeconds: 0, maxAttempts: 1 }).poll();
+      expect(fault.handles).toHaveLength(2);
+      expect((await sqs.send(new ReceiveMessageCommand({ QueueUrl: inputUrl, WaitTimeSeconds: 0 }))).Messages ?? []).toHaveLength(0);
+      expect((await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlqUrl, WaitTimeSeconds: 0 }))).Messages ?? []).toHaveLength(0);
+      expect((await new Queries(orm).transaction({ providerId: item.payload.providerId, externalId: item.payload.externalTransactionId })).status).toBe('PROCESSED');
+      expect(await orm.em.getConnection().execute("SELECT id FROM wallet_ledger_entries WHERE wallet_id = ? AND direction = 'DEBIT'", [item.wallet.id])).toHaveLength(1);
+      await reconciled(item.wallet.id, '75.00');
+    } finally { fault.client.destroy(); }
+  });
+
+  test('invalid receipt handle waits for redelivery instead of retrying the stale handle', async () => {
+    const item = await scenario();
+    const fault = failingAcknowledgements(1, false, 'ReceiptHandleIsInvalid');
+    try {
+      await send(item.message);
+      const options = { waitSeconds: 0, visibilitySeconds: 1, maxAttempts: 1 };
+      await new QueueConsumer(fault.client, inputUrl, dlqUrl, store, undefined, options).poll();
+      expect(fault.handles).toHaveLength(1);
+      await pollRedelivery(new QueueConsumer(fault.client, inputUrl, dlqUrl, store, undefined, options));
+      expect(fault.handles).toHaveLength(2);
+      expect(fault.handles[1]).not.toBe(fault.handles[0]);
+      expect((await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlqUrl, WaitTimeSeconds: 0 }))).Messages ?? []).toHaveLength(0);
+      await reconciled(item.wallet.id, '75.00');
+    } finally { fault.client.destroy(); }
+  });
+
+  test('ACK retry after DLQ forwarding does not publish another DLQ copy within the same delivery', async () => {
+    const fault = failingAcknowledgements(2);
+    const metrics = new Telemetry();
+    try {
+      await send({ invalid: true });
+      await new QueueConsumer(fault.client, inputUrl, dlqUrl, store, metrics, { waitSeconds: 0 }).poll();
+      expect(fault.handles).toHaveLength(3);
+      const dlq = await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlqUrl, WaitTimeSeconds: 0, MaxNumberOfMessages: 10 }));
+      expect(dlq.Messages).toHaveLength(1);
+      for (const message of dlq.Messages ?? []) await sqs.send(new DeleteMessageCommand({ QueueUrl: dlqUrl, ReceiptHandle: message.ReceiptHandle! }));
+      expect((await sqs.send(new ReceiveMessageCommand({ QueueUrl: inputUrl, WaitTimeSeconds: 0 }))).Messages ?? []).toHaveLength(0);
+      expect(await metrics.registry.metrics()).toContain('wager_dlq_total 1');
+    } finally { fault.client.destroy(); }
   });
 
   test('two concurrent publishers publish committed events once and drain outbox', async () => {

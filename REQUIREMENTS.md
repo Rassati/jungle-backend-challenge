@@ -12,10 +12,10 @@ Referência: [enunciado original](CHALLENGE.md). Os nomes abaixo correspondem ao
 | 7.1 — Fora de ordem | Agenda persistida, backoff, 12 reprocessamentos e rejeição após expiração | `ReferenceWorker`, `retryPending`, `workers.test.ts` |
 | 8 — Concorrência | PESSIMISTIC_WRITE por carteira e constraints; carteiras independentes em paralelo | `wagering.test.ts`, fixture `submit-process.ts` |
 | 9 — HTTP | Todos os endpoints, validação, status distintos, cursor estável, reconciliação e health | `src/http/`, `queries.ts`, `http.test.ts`, coleção Postman |
-| 10 — SQS | Mesmo submit da API, inbox persistente, confirmação após commit, heartbeat, retry/DLQ e encerramento | `QueueConsumer`, `runtime.ts`, `workers.test.ts` |
+| 10 — SQS | Mesmo submit da API, inbox persistente, confirmação após commit, retry de ACK separado, heartbeat, retry/DLQ e encerramento | `QueueConsumer`, `runtime.ts`, `workers.test.ts` |
 | 11 — Outbox | Eventos versionados, SQL atômico, publicadores concorrentes e retomada após queda | `integration-event.ts`, `OutboxPublisher`, testes de falha |
 | 12 — Observabilidade | Logs JSON, correlação, estados, duplicatas, retries, DLQ, locks, lag e latências | `observability.ts`, `/metrics`, testes HTTP/workers |
-| 13 — Testes | 106 testes unitários e integrados, sem substituir PostgreSQL/SQS por mocks | `tests/unit/`, `tests/integration/`, `tests/fixtures/` |
+| 13 — Testes | 111 testes unitários e integrados; falhas de ACK injetadas no transporte, com PostgreSQL/SQS reais | `tests/unit/`, `tests/integration/`, `tests/fixtures/` |
 | 14 — Documentação | Setup, comandos, decisões, garantias e limitações | `README.md`, `ARCHITECTURE.md`, este mapeamento |
 
 ## Cenários de concorrência e recuperação exigidos
@@ -27,6 +27,11 @@ Referência: [enunciado original](CHALLENGE.md). Os nomes abaixo correspondem ao
 | Carteiras distintas em paralelo | `wagering.test.ts` — `different wallets process concurrently` |
 | Três processos simultâneos | `wagering.test.ts` — `three independent Bun processes` |
 | Queda após commit e antes do ack | `workers.test.ts` — `consumer killed after commit before ack` |
+| Falha temporária ao excluir após commit | `workers.test.ts` — `transient ACK failures` |
+| ACK esgotado, reinício e reentrega com novo handle | `workers.test.ts` — `exhausted ACK retries survive restart` |
+| Resposta perdida após exclusão real no SQS | `workers.test.ts` — `lost ACK response after SQS deletion` |
+| Handle inválido aguarda nova entrega | `workers.test.ts` — `invalid receipt handle` |
+| Retry de ACK após encaminhamento à DLQ | `workers.test.ts` — `ACK retry after DLQ forwarding` |
 | Dois publicadores sobre a mesma outbox | `workers.test.ts` — `two concurrent publishers` |
 | Estorno antes da aposta | `workers.test.ts` — `refund before bet` |
 | Reinício e consistência final | `workers.test.ts` — testes de novas conexões/processos e reconciliação |
