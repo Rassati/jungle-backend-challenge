@@ -2,6 +2,12 @@
 
 Implementação do desafio Jungle Gaming. O enunciado original está em `CHALLENGE.md`.
 
+## Demonstração de idempotência
+
+A demo cria uma carteira de teste, envia três cópias da mesma aposta pela fila e confere que o saldo final é **R$ 75**, com um único efeito financeiro. Execute `bun run demo:sqs` no contêiner da API após [iniciar o ambiente Docker](#iniciar-toda-a-aplicação-com-docker).
+
+O consumidor confirma a mensagem depois do commit. Se houver reentrega, o resultado persistido é reaproveitado. Para a publicação de eventos, o sistema usa uma outbox e um identificador estável que permite aos consumidores deduplicar eventos. Veja as [decisões de arquitetura](ARCHITECTURE.md).
+
 ## Estado atual
 
 API NestJS, consumidor SQS, publicador de outbox e worker de referências pendentes. PostgreSQL com migrations reversíveis, bloqueio por carteira, idempotência persistente, ledger imutável e inbox/outbox transacionais. Testes reais incluem 50 envios concorrentes, três processos Bun independentes e processos interrompidos após commit ou publicação. Autenticação real e diferenciais opcionais não estão implementados; decisões e limitações estão em `ARCHITECTURE.md`.
@@ -22,7 +28,7 @@ docker compose --profile app logs -f api
 docker compose --profile app stop
 ```
 
-A demonstração cria uma carteira de teste, envia três cópias de uma aposta pela fila e verifica saldo de R$ 75 e reconciliação consistente. Ela deixa os registros auditáveis no banco local. Os testes automatizados, por sua vez, usam bancos e filas temporários exclusivos e removem esses recursos ao terminar.
+A demonstração verifica a reconciliação e deixa os registros auditáveis no banco local. Os testes automatizados, por sua vez, usam bancos e filas temporários exclusivos e removem esses recursos ao terminar.
 
 `stop` preserva o volume do PostgreSQL. Para desenvolver com Bun na máquina, inicie apenas os serviços base como descrito abaixo e não mantenha uma segunda API usando a mesma porta.
 
